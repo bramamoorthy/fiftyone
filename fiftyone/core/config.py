@@ -5,19 +5,6 @@ FiftyOne config.
 | `voxel51.com <https://voxel51.com/>`_
 |
 """
-# pragma pylint: disable=redefined-builtin
-# pragma pylint: disable=unused-wildcard-import
-# pragma pylint: disable=wildcard-import
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-from builtins import *
-
-# pragma pylint: enable=redefined-builtin
-# pragma pylint: enable=unused-wildcard-import
-# pragma pylint: enable=wildcard-import
-
 import logging
 import os
 
@@ -63,8 +50,15 @@ class FiftyOneConfig(EnvConfig):
             env_var="FIFTYONE_DEFAULT_IMAGE_EXT",
             default=".jpg",
         )
+        self.show_progress_bars = self.parse_bool(
+            d,
+            "show_progress_bars",
+            env_var="FIFTYONE_SHOW_PROGRESS_BARS",
+            default=True,
+        )
 
         self._set_defaults()
+        self._validate()
 
     def _set_defaults(self):
         if self.default_dataset_dir is None:
@@ -75,14 +69,14 @@ class FiftyOneConfig(EnvConfig):
         if self.default_ml_backend is None:
             installed_packages = _get_installed_packages()
 
-            if "tensorflow" in installed_packages:
-                logger.debug("Setting default ML backend to TensorFlow")
-                self.default_ml_backend = "tensorflow"
-            elif "torch" in installed_packages:
-                logger.debug("Setting default ML backend to PyTorch")
+            if "torch" in installed_packages:
                 self.default_ml_backend = "torch"
-            else:
-                logger.debug("No suitable default ML backend found")
+            elif "tensorflow" in installed_packages:
+                self.default_ml_backend = "tensorflow"
+
+    def _validate(self):
+        if self.default_ml_backend is not None:
+            self.default_ml_backend = self.default_ml_backend.lower()
 
 
 def load_config():
@@ -111,12 +105,11 @@ def set_config_settings(**kwargs):
 
     # Apply settings
     for field in kwargs:
-        if not hasattr(fo.config, field):
+        if not hasattr(_config, field):
             logger.warning("Skipping unknown config setting '%s'", field)
             continue
 
         val = getattr(_config, field)
-        logger.debug("Setting config field %s = %s", field, str(val))
         setattr(fo.config, field, val)
 
 

@@ -1,47 +1,33 @@
 """
-Session class for interacting with the FiftyOne Dashboard.
+Session class for interacting with the FiftyOne App.
 
 | Copyright 2017-2020, Voxel51, Inc.
 | `voxel51.com <https://voxel51.com/>`_
 |
 """
-# pragma pylint: disable=redefined-builtin
-# pragma pylint: disable=unused-wildcard-import
-# pragma pylint: disable=wildcard-import
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-from builtins import *
-
-# pragma pylint: enable=redefined-builtin
-# pragma pylint: enable=unused-wildcard-import
-# pragma pylint: enable=wildcard-import
-
-import atexit
 import logging
-import signal
 
 import fiftyone.core.client as foc
 import fiftyone.core.service as fos
 from fiftyone.core.state import StateDescription
 
 
-# Global session singleton
-session = None
 logger = logging.getLogger(__name__)
 
+# Global session singleton
+session = None
 
-def launch_dashboard(dataset=None, view=None, port=5151, remote=False):
-    """Launches the FiftyOne Dashboard.
 
-    Only one dashboard instance can be opened at a time. If this method is
-    called when another dashboard exists, the existing dashboard is closed.
+def launch_app(dataset=None, view=None, port=5151, remote=False):
+    """Launches the FiftyOne App.
+
+    Only one app instance can be opened at a time. If this method is
+    called when another app exists, the existing app is closed.
 
     Args:
-        dataset (None): an optionl :class:`fiftyone.core.dataset.Dataset` to
+        dataset (None): an optional :class:`fiftyone.core.dataset.Dataset` to
             load
-        view (None): an optionl :class:`fiftyone.core.view.DatasetView` to
+        view (None): an optional :class:`fiftyone.core.view.DatasetView` to
             load
         port (5151): the port number of the server
         remote (False): whether this is a remote session
@@ -51,7 +37,7 @@ def launch_dashboard(dataset=None, view=None, port=5151, remote=False):
     """
     global session  # pylint: disable=global-statement
     #
-    # Note, we always `close_dashboard()` here rather than just calling
+    # Note, we always `close_app()` here rather than just calling
     # `session.open()` if a session already exists, because the app may have
     # been closed in some way other than `session.close()` --- e.g., the user
     # closing the GUI --- in which case the underlying Electron process may
@@ -60,16 +46,16 @@ def launch_dashboard(dataset=None, view=None, port=5151, remote=False):
     #
     # @todo this can probably be improved
     #
-    close_dashboard()
+    close_app()
 
     session = Session(dataset=dataset, view=view, port=port, remote=remote)
 
     return session
 
 
-def close_dashboard():
-    """Closes the FiftyOne Dashboard, if necessary.
-    If no dashboard is currently open, this method has no effect.
+def close_app():
+    """Closes the FiftyOne App, if necessary.
+    If no app is currently open, this method has no effect.
     """
     global session  # pylint: disable=global-statement
 
@@ -88,14 +74,14 @@ def _update_state(func):
 
 
 class Session(foc.HasClient):
-    """Session that maintains a 1-1 shared state with the FiftyOne Dashboard.
+    """Session that maintains a 1-1 shared state with the FiftyOne App.
 
     **Basic Usage**
 
-    -   Use :func:`launch_dashboard` to launch the dashboard and retrieve its
+    -   Use :func:`launch_app` to launch the app and retrieve its
         corresponding :class:`Session` instance.
 
-    -   To open a dataset in the dashboard, simply set the
+    -   To open a dataset in the app, simply set the
         :attr:`Session.dataset` property of the session to your
         :class:`fiftyone.core.dataset.Dataset`.
 
@@ -104,25 +90,25 @@ class Session(foc.HasClient):
         :class:`fiftyone.core.view.DatasetView`.
 
     -   Use :attr:`Session.selected` to retrieve the IDs of the currently
-        selected samples in the dashboard.
+        selected samples in the app.
 
     -   Use :func:`Session.close` and :func:`Session.open` to temporarily close
-        and reopen the dashboard without creating a new :class:`Session`
+        and reopen the app without creating a new :class:`Session`
         instance.
 
-    -   Use :func:`close_dashboard` to programmatically close the dashboard and
-        teriminate the session.
+    -   Use :func:`close_app` to programmatically close the app and
+        terminate the session.
 
     Note that only one session instance can exist at any time.
 
     Args:
-        dataset (None): an optionl :class:`fiftyone.core.dataset.Dataset` to
+        dataset (None): an optional :class:`fiftyone.core.dataset.Dataset` to
             load
-        view (None): an optionl :class:`fiftyone.core.view.DatasetView` to
+        view (None): an optional :class:`fiftyone.core.view.DatasetView` to
             load
         port (5151): the port to use to connect the FiftyOne app.
-        remote (False): whether this is a remote session. Remote sessions do not
-            launch the FiftyOne app
+        remote (False): whether this is a remote session. Remote sessions do
+            not launch the FiftyOne app
     """
 
     _HC_NAMESPACE = "state"
@@ -139,7 +125,7 @@ class Session(foc.HasClient):
         self._port = port
         self._remote = remote
 
-        super(Session, self).__init__(self._port)
+        super().__init__(self._port)
 
         if view is not None:
             self.view = view
@@ -148,38 +134,12 @@ class Session(foc.HasClient):
 
         if not self._remote:
             self._app_service = fos.AppService()
-            _close_on_exit(self)
+            logger.info("App launched")
         else:
             logger.info(
-                "You have launched a remote session and will need to configure "
-                "port forwarding. The current port number is %d.\n\n"
-                "Runnning the following command forwards this session to the default"
-                " port of 5151 on your local machine.\n"
-                "ssh -N -L %d:127.0.0.1:5151 username@this_machine_ip\n"
-                % (self.server_port, self.server_port)
+                _REMOTE_INSTRUCTIONS.strip()
+                % (self.server_port, self.server_port, self.server_port)
             )
-
-    def open(self):
-        """Opens the session.
-
-        This opens the FiftyOne Dashboard, if necessary.
-        """
-        if self._remote:
-            raise ValueError("Remote sessions cannot launch the FiftyOne app")
-        self._app_service.start()
-
-    def close(self):
-        """Closes the session.
-
-        This terminates the FiftyOne Dashboard, if necessary.
-        """
-        if self._remote:
-            return
-
-        self._close = True
-        self._update_state()
-
-    # GETTERS #################################################################
 
     @property
     def dataset(self):
@@ -190,28 +150,26 @@ class Session(foc.HasClient):
 
         return self._dataset
 
-    @property
-    def view(self):
-        """The :class:`fiftyone.core.view.DatasetView` connected to the
-        session, or ``None`` if no view is connected.
-        """
-        return self._view
-
-    @property
-    def selected(self):
-        """A list of sample IDs of the currently selected samples in the
-        FiftyOne app.
-        """
-        return list(self.state.selected)
-
-    # SETTERS #################################################################
-
     @dataset.setter
     @_update_state
     def dataset(self, dataset):
         self._dataset = dataset
         self._view = None
         self.state.selected = []
+
+    @_update_state
+    def clear_dataset(self):
+        """Clears the current :class:`fiftyone.core.dataset.Dataset` from the
+        session, if any.
+        """
+        self.dataset = None
+
+    @property
+    def view(self):
+        """The :class:`fiftyone.core.view.DatasetView` connected to the
+        session, or ``None`` if no view is connected.
+        """
+        return self._view
 
     @view.setter
     @_update_state
@@ -222,21 +180,50 @@ class Session(foc.HasClient):
 
         self.state.selected = []
 
-    # CLEAR STATE #############################################################
-
-    @_update_state
-    def clear_dataset(self):
-        """Clears the current :class:`fiftyone.core.dataset.Dataset` from the
-        session, if any.
-        """
-        self.dataset = None
-
     @_update_state
     def clear_view(self):
         """Clears the current :class:`fiftyone.core.view.DatasetView` from the
         session, if any.
         """
         self.view = None
+
+    @property
+    def selected(self):
+        """A list of sample IDs of the currently selected samples in the
+        FiftyOne app.
+        """
+        return list(self.state.selected)
+
+    def open(self):
+        """Opens the session.
+
+        This opens the FiftyOne App, if necessary.
+        """
+        if self._remote:
+            raise ValueError("Remote sessions cannot launch the FiftyOne app")
+
+        self._app_service.start()
+
+    def close(self):
+        """Closes the session.
+
+        This terminates the FiftyOne App, if necessary.
+        """
+        if self._remote:
+            return
+
+        self._close = True
+        self._update_state()
+
+    def wait(self):
+        """Waits for the FiftyOne App to be closed by the user.
+
+        This requires a local (not remote) session.
+        """
+        if self._remote:
+            raise ValueError("Cannot `wait()` for remote sessions to close")
+
+        self._app_service.wait()
 
     # PRIVATE #################################################################
 
@@ -250,13 +237,17 @@ class Session(foc.HasClient):
         )
 
 
-def _close_on_exit(session):
-    def handle_exit():
-        try:
-            session.close()
-        except:
-            pass
+_REMOTE_INSTRUCTIONS = """
+You have launched a remote app on port %d. To connect to this app
+from another machine, issue the following command:
 
-    atexit.register(handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-    signal.signal(signal.SIGINT, handle_exit)
+fiftyone app connect --destination [<username>@]<hostname> --port %d
+
+where `[<username>@]<hostname>` refers to your current machine. Alternatively,
+you can manually configure port forwarding on another machine as follows:
+
+ssh -N -L 5151:127.0.0.1:%d [<username>@]<hostname>
+
+and then connect to the app on that machine using either
+`fiftyone app connect` or from Python via `fiftyone.launch_app()`.
+"""

@@ -5,35 +5,57 @@ FiftyOne Flask server.
 | `voxel51.com <https://voxel51.com/>`_
 |
 """
-# pragma pylint: disable=redefined-builtin
-# pragma pylint: disable=unused-wildcard-import
-# pragma pylint: disable=wildcard-import
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-from builtins import *
-
-# pragma pylint: enable=redefined-builtin
-# pragma pylint: enable=unused-wildcard-import
-# pragma pylint: enable=wildcard-import
-
+import argparse
+import json
 import logging
 import os
+import uuid
 
-from flask import Flask, request, send_file
+from bson import json_util
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
 from flask_socketio import emit, Namespace, SocketIO
 
+import eta.core.utils as etau
+
 os.environ["FIFTYONE_SERVER"] = "1"
+import fiftyone.constants as foc
+import fiftyone.core.fields as fof
+import fiftyone.core.odm as foo
+from fiftyone.core.stages import _STAGES
 import fiftyone.core.state as fos
+
+from util import get_image_size
+from pipelines import DISTRIBUTION_PIPELINES, LABELS, SCALARS
 
 
 logger = logging.getLogger(__name__)
 
+foo.get_db_conn()
+
 app = Flask(__name__)
+CORS(app)
+
 app.config["SECRET_KEY"] = "fiftyone"
 
-socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origin="*")
+socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
+
+
+def get_user_id():
+    uid_path = os.path.join(foc.FIFTYONE_CONFIG_DIR, "var", "uid")
+
+    def read():
+        try:
+            with open(uid_path) as f:
+                return next(f).strip()
+        except (IOError, StopIteration):
+            return None
+
+    if not read():
+        os.makedirs(os.path.dirname(uid_path), exist_ok=True)
+        with open(uid_path, "w") as f:
+            f.write(str(uuid.uuid4()))
+    return read()
 
 
 @app.route("/")
@@ -47,9 +69,25 @@ def get_sample_media():
     return send_file(path)
 
 
+@app.route("/fiftyone")
+def get_fiftyone_info():
+    return jsonify({"version": foc.VERSION})
+
+
+@app.route("/stages")
+def get_stages():
+    """Gets ViewStage descriptions"""
+    return {
+        "stages": [
+            {"name": stage.__name__, "params": stage._params()}
+            for stage in _STAGES
+        ]
+    }
+
+
 def _load_state(func):
     def wrapper(self, *args, **kwargs):
-        state = fos.StateDescription.from_dict(self.state)
+        state = fos.StateDescriptionWithDerivables.from_dict(self.state)
         state = func(self, state, *args, **kwargs)
         self.state = state.serialize()
         emit("update", self.state, broadcast=True, include_self=False)
@@ -62,16 +100,17 @@ class StateController(Namespace):
     """State controller.
 
     Attributes:
-        state: a :class:`fiftyone.core.state.StateDescription` instance
+        state: a :class:`fiftyone.core.state.StateDescriptionWithDerivables`
+               instance
 
     Args:
-        **args: postional arguments for ``flask_socketio.Namespace``
+        **args: positional arguments for ``flask_socketio.Namespace``
         **kwargs: keyword arguments for ``flask_socketio.Namespace``
     """
 
     def __init__(self, *args, **kwargs):
-        self.state = fos.StateDescription().serialize()
-        super(StateController, self).__init__(*args, **kwargs)
+        self.state = fos.StateDescriptionWithDerivables().serialize()
+        super().__init__(*args, **kwargs)
 
     def on_connect(self):
         """Handles connection to the server."""
@@ -81,20 +120,35 @@ class StateController(Namespace):
         """Handles disconnection from the server."""
         pass
 
-    def on_update(self, state):
+    def on_update(self, data):
         """Updates the state.
 
         Args:
-            state: a serialized :class:`fiftyone.core.state.StateDescription`
+            state_dict: a serialized
+                :class:`fiftyone.core.state.StateDescription`
         """
-        self.state = state
-        emit("update", state, broadcast=True, include_self=False)
+        self.state = fos.StateDescriptionWithDerivables.from_dict(
+            data["data"]
+        ).serialize()
+        emit(
+            "update",
+            self.state,
+            broadcast=True,
+            include_self=data["include_self"],
+        )
+
+    def on_get_fiftyone_info(self):
+        """Retrieves information about the FiftyOne installation."""
+        return {
+            "version": foc.VERSION,
+            "user_id": get_user_id(),
+        }
 
     def on_get_current_state(self, _):
         """Gets the current state.
 
         Returns:
-            a :class:`fiftyone.core.state.StateDescription`
+            a :class:`fiftyone.core.state.StateDescriptionWithDerivables`
         """
         return self.state
 
@@ -103,11 +157,13 @@ class StateController(Namespace):
         """Adds a sample to the selected samples list.
 
         Args:
-            state: the current :class:`fiftyone.core.state.StateDescription`
+            state: the current
+                :class:`fiftyone.core.state.StateDescriptionWithDerivables`
             _id: the sample ID
 
         Returns:
-            the updated :class:`fiftyone.core.state.StateDescription`
+            the updated
+                :class:`fiftyone.core.state.StateDescriptionWithDerivables`
         """
         selected = set(state.selected)
         selected.add(_id)
@@ -119,11 +175,13 @@ class StateController(Namespace):
         """Remove a sample from the selected samples list
 
         Args:
-            state: the current :class:`fiftyone.core.state.StateDescription`
+            state: the current
+                :class:`fiftyone.core.state.StateDescriptionWithDerivables`
             _id: the sample ID
 
         Returns:
-            the updated :class:`fiftyone.core.state.StateDescription`
+            the updated
+                :class:`fiftyone.core.state.StateDescriptionWithDerivables`
         """
         selected = set(state.selected)
         selected.remove(_id)
@@ -140,70 +198,191 @@ class StateController(Namespace):
         Returns:
             the list of sample dicts for the page
         """
-        state = fos.StateDescription.from_dict(self.state)
+        state = fos.StateDescriptionWithDerivables.from_dict(self.state)
         if state.view is not None:
             view = state.view
         elif state.dataset is not None:
-            view = state.dataset.default_view()
+            view = state.dataset.view()
         else:
             return []
 
-        view = view.skip((page - 1) * page_length).limit(page_length)
-        return [s.get_backing_doc_dict(extended=True) for s in view]
+        view = view.skip((page - 1) * page_length).limit(page_length + 1)
+        samples = [
+            json.loads(
+                json_util.dumps(s.to_mongo_dict()), parse_constant=lambda c: c
+            )
+            for s in view
+        ]
+        more = False
+        if len(samples) > page_length:
+            samples = samples[:page_length]
+            more = page + 1
 
-    def on_get_label_distributions(self, _):
-        """Gets the labels distributions for the current state.
+        results = [{"sample": s} for s in samples]
+        for r in results:
+            w, h = get_image_size(r["sample"]["filepath"])
+            r["width"] = w
+            r["height"] = h
+
+        return {"results": results, "more": more}
+
+    def on_get_distributions(self, group):
+        """Gets the distributions for the current state with respect to a
+        group.
 
         Args:
-            _: the message, which is not used
+            group: one of "labels", "tags", or "scalars"
 
         Returns:
-            the list of label distributions
+            a list of distributions
         """
-        state = fos.StateDescription.from_dict(self.state)
+        state = fos.StateDescriptionWithDerivables.from_dict(self.state)
         if state.view is not None:
             view = state.view
         elif state.dataset is not None:
-            view = state.dataset.default_view()
+            view = state.dataset.view()
         else:
             return []
 
-        return view._get_label_distributions()
+        return _get_distributions(view, group)
 
-    def on_get_facets(self, _):
-        """Gets the facets for the current state.
 
-        Args:
-            _: the message, which is not used
+def _get_distributions(view, group):
+    pipeline = DISTRIBUTION_PIPELINES[group]
 
-        Returns:
-            the list of facets
-        """
-        state = fos.StateDescription.from_dict(self.state)
-        if state.view is not None:
-            view = state.view
-        elif state.dataset is not None:
-            view = state.dataset.default_view()
-        else:
-            return []
+    # we add a sub-pipeline for each numeric as it looks like multiple
+    # buckets in a single pipeline is not supported
+    if group == SCALARS:
+        _numeric_distribution_pipelines(view, pipeline)
 
-        return view._get_facets()
+    result = list(view.aggregate(pipeline))
 
-    def on_set_facets(self, facets):
-        """Sets the facets for the current state.
+    if group in {LABELS, SCALARS}:
+        new_result = []
+        for f in result[0].values():
+            new_result += f
+        result = new_result
 
-        Args:
-            facets: the facets string
-        """
-        _, value = facets.split(".")
-        state = fos.StateDescription.from_dict(self.state)
-        state.view = state.dataset.default_view().match_tag(value)
-        self.state = state.serialize()
-        emit("update", self.state, broadcast=True, include_self=True)
+    if group != SCALARS:
+        for idx, dist in enumerate(result):
+            result[idx]["data"] = sorted(
+                result[idx]["data"], key=lambda c: c["count"], reverse=True
+            )
+
+    return sorted(result, key=lambda d: d["name"])
+
+
+def _numeric_bounds(view, numerics):
+    bounds_pipeline = [{"$facet": {}}]
+    for idx, (k, v) in enumerate(numerics.items()):
+        bounds_pipeline[0]["$facet"]["numeric-%d" % idx] = [
+            {
+                "$group": {
+                    "_id": k,
+                    "min": {"$min": "$%s" % k},
+                    "max": {"$max": "$%s" % k},
+                },
+            }
+        ]
+
+    return list(view.aggregate(bounds_pipeline))[0] if len(numerics) else {}
+
+
+def _get_label_fields(view):
+    label_fields = []
+
+    # @todo is this necessary?
+    label_fields.append({"_id": {"field": "_id"}})
+
+    # @todo can we remove the "_id" nesting?
+    for k, v in view.get_field_schema().items():
+        d = {"field": k}
+        if isinstance(v, fof.EmbeddedDocumentField):
+            d["cls"] = v.document_type.__name__
+
+        label_fields.append({"_id": d})
+
+    return label_fields
+
+
+def _numeric_distribution_pipelines(view, pipeline, buckets=50):
+    numerics = view._dataset.get_field_schema(ftype=fof.IntField)
+    numerics.update(view._dataset.get_field_schema(ftype=fof.FloatField))
+
+    # here we query the min and max for each numeric field
+    # unfortunately, it looks like this has to be a separate query
+    bounds = _numeric_bounds(view, numerics)
+
+    # for each numeric field, build the boundaries array with the
+    # min/max results when adding the field's sub-pipeline
+    for idx, (k, v) in enumerate(numerics.items()):
+        sub_pipeline = "numeric-%d" % idx
+        field_bounds = bounds[sub_pipeline][0]
+        mn = field_bounds["min"]
+        mx = field_bounds["max"]
+
+        # if min and max are equal, we artifically create a boundary
+        # @todo alternative approach to scalar fields with only one value
+        if mn == mx:
+            if mx > 0:
+                mn = 0
+            else:
+                mx = 0
+
+        step = (mx - mn) / buckets
+        boundaries = [mn + step * s for s in range(0, buckets)]
+
+        pipeline[0]["$facet"][sub_pipeline] = [
+            {
+                "$bucket": {
+                    "groupBy": "$%s" % k,
+                    "boundaries": boundaries,
+                    "default": "null",
+                    "output": {"count": {"$sum": 1}},
+                }
+            },
+            {
+                "$group": {
+                    "_id": k,
+                    "data": {
+                        "$push": {
+                            "key": {
+                                "$cond": [
+                                    {"$ne": ["$_id", "null"]},
+                                    {"$add": ["$_id", step / 2]},
+                                    "null",
+                                ]
+                            },
+                            "count": "$count",
+                        }
+                    },
+                }
+            },
+            {
+                "$project": {
+                    "name": k,
+                    "type": v.__class__.__name__[
+                        : -len("Field")  # grab field type from the class
+                    ].lower(),
+                    "data": "$data",
+                }
+            },
+        ]
 
 
 socketio.on_namespace(StateController("/state"))
 
 
 if __name__ == "__main__":
-    socketio.run(app, debug=True)
+    log_path = os.path.join(
+        foc.FIFTYONE_CONFIG_DIR, "var", "log", "server.log"
+    )
+    etau.ensure_basedir(log_path)
+    # pylint: disable=no-member
+    app.logger.addHandler(logging.FileHandler(log_path, mode="w"))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=5151)
+    args = parser.parse_args()
+
+    socketio.run(app, port=args.port, debug=foc.DEV_INSTALL)
